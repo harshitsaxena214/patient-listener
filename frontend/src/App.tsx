@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState, useRef, useCallback } from "react";
 import {
   AlertCircle,
   AlertTriangle,
@@ -16,6 +16,7 @@ import { parseSSEStream } from "./sse";
 import { ReplayTimeline, type SpeechSegment } from "./ReplayTimeline";
 import { ResultsDashboard } from "./ResultsDashboard";
 import { formatDelayLine } from "./resultLine";
+import { formatEngineSummary, summarizeDemoSet, type EngineOutcome, type ScenarioOutcome } from "./demoTally";
 
 interface DecisionEntry {
   checkpointMs: number;
@@ -24,6 +25,16 @@ interface DecisionEntry {
   choice: string;
   latencyMs: number;
   arrivalMs: number;
+}
+
+interface SpeakerProfile {
+  user_id: string;
+  resumed_median_ms: number | null;
+  finished_median_ms: number | null;
+  filler_rate: number | null;
+  has_history: boolean;
+  rendered: string;
+  regrets_count: number;
 }
 
 interface ReplayErrorInfo {
@@ -45,19 +56,16 @@ export const App: React.FC = () => {
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [isDemoSetRunning, setIsDemoSetRunning] = useState<boolean>(false);
   const [demoSetIndex, setDemoSetIndex] = useState<number>(0);
-  const [demoSetTally, setDemoSetTally] = useState<{
-    total: number;
-    fixedInterrupted: number;
-    plInterrupted: number;
-    fixedDelays: number[];
-    plDelays: number[];
-  }>({
-    total: 0,
-    fixedInterrupted: 0,
-    plInterrupted: 0,
-    fixedDelays: [],
-    plDelays: [],
-  });
+  const [demoOutcomes, setDemoOutcomes] = useState<ScenarioOutcome[]>([]);
+  const [demoSetSize, setDemoSetSize] = useState<number>(0);
+  // Outcome of the replay currently streaming, filled from its own events only.
+  const runOutcomeRef = useRef<{
+    fixed: EngineOutcome | null;
+    patientListener: EngineOutcome | null;
+    fixedRespondedAt: number | null;
+    plRespondedAt: number | null;
+    error: string | null;
+  }>({ fixed: null, patientListener: null, fixedRespondedAt: null, plRespondedAt: null, error: null });
 
   const [replayError, setReplayError] = useState<ReplayErrorInfo | null>(null);
 
@@ -95,13 +103,24 @@ export const App: React.FC = () => {
     responseDelayMs: null,
   });
 
+  // Reply generated after Patient Listener decides RESPOND (Bedrock, or labeled mock)
+  const [plReply, setPlReply] = useState<{
+    text: string;
+    source: "bedrock" | "mock" | null;
+    modelId: string | null;
+    firstTokenMs: number | null;
+    done: boolean;
+    error: string | null;
+  }>({ text: "", source: null, modelId: null, firstTokenMs: null, done: false, error: null });
+
   const abortControllerRef = useRef<AbortController | null>(null);
+  const fixedCutSilenceRef = useRef<number | null>(null);
   const activeSegmentStartRef = useRef<number | null>(null);
 
   const apiBase = (import.meta.env.VITE_API_URL as string) || "http://localhost:8000";
 
   // Fetch Health & Provenance
-  const fetchHealth = async () => {
+  const fetchHealth = useCallback(async () => {
     try {
       const resp = await fetch(`${apiBase}/health`);
       if (resp.ok) {
@@ -111,33 +130,82 @@ export const App: React.FC = () => {
     } catch (err) {
       console.error("Failed to fetch /health:", err);
     }
-  };
+  }, [apiBase]);
 
   // Fetch Scenarios Catalog
-  const fetchScenarios = async () => {
+  const fetchScenarios = useCallback(async () => {
     try {
       const resp = await fetch(`${apiBase}/scenarios`);
       if (resp.ok) {
         const json = await resp.json();
         const list: ScenarioItem[] = Array.isArray(json) ? json : json.scenarios || [];
         setScenarios(list);
-        if (list.length > 0 && !selectedScenarioId) {
-          // Default to first demo-flagged scenario
-          const firstDemo = list.find((s) => s.demo) || list[0];
-          setSelectedScenarioId(firstDemo.id);
+        if (list.length > 0) {
+          setSelectedScenarioId((curr) => {
+            if (!curr) {
+              const firstDemo = list.find((s) => s.demo) || list[0];
+              return firstDemo.id;
+            }
+            return curr;
+          });
         }
       }
     } catch (err) {
       console.error("Failed to fetch /scenarios:", err);
     }
-  };
+  }, [apiBase]);
 
   useEffect(() => {
     fetchHealth();
     fetchScenarios();
-  }, [apiBase]);
+  }, [fetchHealth, fetchScenarios]);
 
   const selectedScenario = scenarios.find((s) => s.id === selectedScenarioId);
+
+  // Speaker pace profile (from prior sessions + logged regrets)
+  const [profile, setProfile] = useState<SpeakerProfile | null>(null);
+  const [regretNote, setRegretNote] = useState<string>("");
+
+  const fetchProfile = async (user: string) => {
+    try {
+      const resp = await fetch(`${apiBase}/profile/${encodeURIComponent(user)}`);
+      if (resp.ok) setProfile(await resp.json());
+    } catch (err) {
+      console.error("Failed to fetch /profile:", err);
+    }
+  };
+
+  useEffect(() => {
+    setRegretNote("");
+    if (selectedScenario?.user) fetchProfile(selectedScenario.user);
+    else setProfile(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedScenario?.user, apiBase]);
+
+  // "The assistant cut me off here": log a regret for the fixed engine's cut-in
+  const logRegret = async () => {
+    if (!selectedScenario) return;
+    const silence = fixedCutSilenceRef.current ?? 800;
+    try {
+      const resp = await fetch(`${apiBase}/regret`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          user_id: selectedScenario.user,
+          session_id: selectedScenario.id,
+          state_text: fixedTranscript,
+          probs: {},
+          silence_ms: silence,
+          action: "RESPOND",
+        }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      setRegretNote(`Logged: cut off after ${silence} ms of silence. Profile updated.`);
+      await fetchProfile(selectedScenario.user);
+    } catch (err) {
+      setRegretNote(`Could not log regret (${err instanceof Error ? err.message : String(err)})`);
+    }
+  };
   const isMock = health?.cache_provenance?.is_mock ?? (health?.cache_provenance?.backend === "mock");
 
   const resetReplayState = () => {
@@ -151,6 +219,8 @@ export const App: React.FC = () => {
     setDecisionsFeed([]);
     setReplayError(null);
     activeSegmentStartRef.current = null;
+    runOutcomeRef.current = { fixed: null, patientListener: null, fixedRespondedAt: null, plRespondedAt: null, error: null };
+    setPlReply({ text: "", source: null, modelId: null, firstTokenMs: null, done: false, error: null });
     setFixedState({
       responded: false,
       respondedAtMs: null,
@@ -178,6 +248,7 @@ export const App: React.FC = () => {
         state_key: ev.state_key,
         state_text: ev.state_text,
       });
+      runOutcomeRef.current.error = shortMsg;
       setIsRunning(false);
       return;
     }
@@ -237,6 +308,8 @@ export const App: React.FC = () => {
       case "respond": {
         if (ev.engine === "fixed") {
           fixedRespondedRef.current = true;
+          runOutcomeRef.current.fixedRespondedAt = ev.t_ms;
+          fixedCutSilenceRef.current = (ev as { silence_ms?: number }).silence_ms ?? null;
           setFixedState((prev) => ({
             ...prev,
             responded: true,
@@ -244,12 +317,33 @@ export const App: React.FC = () => {
           }));
         } else if (ev.engine === "patient_listener") {
           plRespondedRef.current = true;
+          runOutcomeRef.current.plRespondedAt = ev.t_ms;
           setPlState((prev) => ({
             ...prev,
             responded: true,
             respondedAtMs: ev.t_ms,
           }));
         }
+        break;
+      }
+      case "reply_chunk": {
+        setPlReply((prev) => ({
+          ...prev,
+          text: prev.text + ev.text,
+          source: ev.reply_source,
+          modelId: ev.model_id,
+        }));
+        break;
+      }
+      case "reply_done": {
+        setPlReply({
+          text: ev.full_reply,
+          source: ev.reply_source,
+          modelId: ev.model_id,
+          firstTokenMs: ev.first_token_ms,
+          done: true,
+          error: ev.error,
+        });
         break;
       }
       case "final": {
@@ -262,11 +356,11 @@ export const App: React.FC = () => {
             interrupted: ev.interrupted,
             responseDelayMs: ev.response_delay_ms,
           }));
-          setDemoSetTally((prev) => ({
-            ...prev,
-            fixedInterrupted: prev.fixedInterrupted + (ev.interrupted ? 1 : 0),
-            fixedDelays: ev.response_delay_ms !== null ? [...prev.fixedDelays, ev.response_delay_ms] : prev.fixedDelays,
-          }));
+          runOutcomeRef.current.fixed = {
+            interrupted: ev.interrupted,
+            respondedAtMs: runOutcomeRef.current.fixedRespondedAt,
+            responseDelayMs: ev.response_delay_ms ?? null,
+          };
         } else if (ev.engine === "patient_listener") {
           if (ev.interrupted) {
             plRespondedRef.current = true;
@@ -276,12 +370,11 @@ export const App: React.FC = () => {
             interrupted: ev.interrupted,
             responseDelayMs: ev.response_delay_ms,
           }));
-          setDemoSetTally((prev) => ({
-            ...prev,
-            total: prev.total + 1,
-            plInterrupted: prev.plInterrupted + (ev.interrupted ? 1 : 0),
-            plDelays: ev.response_delay_ms !== null ? [...prev.plDelays, ev.response_delay_ms] : prev.plDelays,
-          }));
+          runOutcomeRef.current.patientListener = {
+            interrupted: ev.interrupted,
+            respondedAtMs: runOutcomeRef.current.plRespondedAt,
+            responseDelayMs: ev.response_delay_ms ?? null,
+          };
         }
         break;
       }
@@ -345,21 +438,26 @@ export const App: React.FC = () => {
     if (demoScenarios.length === 0) return;
 
     setIsDemoSetRunning(true);
-    setDemoSetTally({
-      total: 0,
-      fixedInterrupted: 0,
-      plInterrupted: 0,
-      fixedDelays: [],
-      plDelays: [],
-    });
+    setDemoOutcomes([]);
+    setDemoSetSize(demoScenarios.length);
 
     for (let i = 0; i < demoScenarios.length; i++) {
       setDemoSetIndex(i);
       const sc = demoScenarios[i];
       setSelectedScenarioId(sc.id);
 
+      // false only on cancel or a failed request; a stream error event still returns true
       const success = await runReplay(sc.id, speed);
       if (!success) break;
+      const r = runOutcomeRef.current;
+      const outcome: ScenarioOutcome = {
+        scenarioId: sc.id,
+        trueEndMs: sc.true_end_t_ms,
+        fixed: r.fixed,
+        patientListener: r.patientListener,
+        error: r.error,
+      };
+      setDemoOutcomes((prev) => [...prev, outcome]);
 
       // Small pause between scenarios
       await new Promise((r) => setTimeout(r, 600));
@@ -369,85 +467,134 @@ export const App: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-indigo-500/30">
-      {/* Top Provenance Banner */}
-      {isMock ? (
-        <div className="w-full bg-rose-900 border-b border-rose-700/80 px-4 py-2.5 text-center text-xs text-rose-100 font-bold uppercase tracking-wider flex items-center justify-center gap-2 shadow-md">
-          <ShieldAlert className="w-4 h-4 text-rose-300" />
-          <span>MOCK-DECIDER, not valid for the demo — real GPU decision cache not installed</span>
-        </div>
-      ) : (
-        <div className="w-full bg-emerald-950/80 border-b border-emerald-600/60 px-4 py-2 text-center text-xs text-emerald-200 font-medium tracking-wide flex items-center justify-center gap-2 shadow-md">
-          <ShieldCheck className="w-4 h-4 text-emerald-400" />
-          <span>
-            Decisions: real Strands Decider 2B (cached), decision latency{" "}
-            {health?.cache_provenance?.decision_latency_ms
-              ? Math.round(health.cache_provenance.decision_latency_ms)
-              : 301}{" "}
-            ms measured on {health?.cache_provenance?.latency_source || "Tesla T4 (cache-measured)"}
-          </span>
-        </div>
-      )}
-
+    <div className="min-h-screen text-slate-100 flex flex-col font-sans">
       {/* Main App Header */}
-      <header className="border-b border-slate-800 bg-slate-900/60 backdrop-blur sticky top-0 z-40">
-        <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-emerald-500 flex items-center justify-center shadow-md shadow-indigo-500/20">
-              <Zap className="w-5 h-5 text-white" />
+      <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur sticky top-0 z-40">
+        <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between gap-6">
+          <div className="flex items-center gap-8">
+            <div className="flex items-center gap-2.5">
+              <div className="w-8 h-8 rounded-md bg-indigo-300 flex items-center justify-center">
+                <Zap className="w-4 h-4 text-slate-950" />
+              </div>
+              <span className="font-mono text-[13px] font-semibold uppercase tracking-[0.12em] text-slate-50 leading-tight">
+                Patient
+                <br />
+                Listener_
+              </span>
             </div>
-            <div>
-              <h1 className="text-lg font-bold text-white tracking-tight flex items-center gap-2">
-                Patient Listener
-                <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-slate-800 text-indigo-300 border border-slate-700">
-                  Strands Decider 2B
-                </span>
-              </h1>
-              <p className="text-[11px] text-slate-400">
-                Personalized, regret-aware voice turn-taking with speculative System One decisions
-              </p>
-            </div>
+
+            {/* Tab Navigation: monospace uppercase links */}
+            <nav className="flex items-center gap-7">
+              {([
+                ["demo", "Side-by-side", Play],
+                ["results", "Results", BarChart2],
+              ] as const).map(([tab, label, Icon]) => (
+                <button
+                  key={tab}
+                  onClick={() => setActiveTab(tab)}
+                  className={`flex items-center gap-2 py-5 font-mono text-[13px] uppercase tracking-[0.14em] border-b-2 transition ${
+                    activeTab === tab
+                      ? "text-slate-50 border-indigo-300"
+                      : "text-slate-400 border-transparent hover:text-slate-200"
+                  }`}
+                >
+                  <Icon className="w-3.5 h-3.5" />
+                  {label}
+                </button>
+              ))}
+            </nav>
           </div>
 
-          {/* Tab Navigation */}
-          <div className="flex items-center gap-2 bg-slate-950 p-1 rounded-xl border border-slate-800">
-            <button
-              onClick={() => setActiveTab("demo")}
-              className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-semibold transition ${
-                activeTab === "demo"
-                  ? "bg-indigo-600 text-white shadow"
-                  : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-              }`}
-            >
-              <Play className="w-3.5 h-3.5" />
-              Side-by-Side Demo
-            </button>
-            <button
-              onClick={() => setActiveTab("results")}
-              className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-semibold transition ${
-                activeTab === "results"
-                  ? "bg-indigo-600 text-white shadow"
-                  : "text-slate-400 hover:text-slate-200 hover:bg-slate-900"
-              }`}
-            >
-              <BarChart2 className="w-3.5 h-3.5" />
-              Benchmark Results
-            </button>
-          </div>
+          <span className="hidden md:inline font-mono text-[11px] uppercase tracking-[0.14em] text-slate-400">
+            #strands-decider-2b · #policy
+          </span>
         </div>
       </header>
 
+      {/* Hero: headline with live turn switch + provenance card */}
+      <section className="max-w-7xl w-full mx-auto px-6 pt-10 pb-6 grid lg:grid-cols-[1fr_380px] gap-8 items-start">
+        <div>
+          <div className="inline-flex items-center gap-2 border border-slate-700 rounded-md px-3 py-1.5 font-mono text-[11px] uppercase tracking-[0.14em] text-slate-400">
+            <span className={`w-1.5 h-1.5 rounded-full ${isRunning ? "bg-indigo-300 animate-pulse" : "bg-slate-500"}`} />
+            {isRunning ? "Replay running" : "Voice turn-taking · Strands Decider 2B"}
+          </div>
+          <h1 className="mt-5 font-display text-5xl md:text-6xl font-semibold leading-[1.02] text-slate-50">
+            Patient Listener{" "}
+            <span
+              aria-label={plState.responded ? "Responding" : "Listening"}
+              className={`inline-flex align-middle w-[86px] h-[46px] rounded-full p-[5px] transition-colors duration-300 ${
+                plState.responded ? "bg-indigo-400" : "bg-slate-800"
+              }`}
+            >
+              <span
+                className={`w-9 h-9 rounded-full transition-transform duration-300 ${
+                  plState.responded ? "translate-x-[40px] bg-slate-50" : "translate-x-0 bg-slate-500"
+                }`}
+              />
+            </span>
+          </h1>
+          <p className="mt-5 max-w-2xl text-lg leading-relaxed text-slate-200">
+            Fixed silence timeouts cut people off mid-thought. Patient Listener asks a small decision model
+            whether you're actually done, and waits when you're not.
+          </p>
+        </div>
+
+        {/* Provenance card */}
+        <div className="border border-slate-800 bg-slate-950/70 rounded-md">
+          <div className="flex items-center justify-between px-5 py-3 border-b border-slate-800 font-mono text-[11px] uppercase tracking-[0.14em] text-slate-400">
+            <span>Decision source</span>
+            {isMock ? (
+              <span className="flex items-center gap-1.5 text-rose-400">
+                <ShieldAlert className="w-3.5 h-3.5" /> Mock
+              </span>
+            ) : (
+              <span className="flex items-center gap-1.5 text-emerald-400">
+                <ShieldCheck className="w-3.5 h-3.5" /> Real
+              </span>
+            )}
+          </div>
+          <div className="px-5 py-4 space-y-3">
+            {isMock ? (
+              <p className="text-sm text-rose-300">
+                MOCK-DECIDER, not valid for the demo. The real GPU decision cache is not installed.
+              </p>
+            ) : (
+              <>
+                <div className="text-xl font-semibold text-slate-50">Strands Decider 2B</div>
+                <div className="font-mono text-xs text-slate-400 break-all">
+                  {health?.cache_provenance?.model_id ?? "cached decisions"}
+                </div>
+                <div className="grid grid-cols-2 gap-3 pt-2 border-t border-slate-800">
+                  <div>
+                    <div className="label-mono">Latency</div>
+                    <div className="text-slate-100 text-sm mt-0.5">
+                      {health?.cache_provenance?.decision_latency_ms
+                        ? `${Math.round(health.cache_provenance.decision_latency_ms)} ms`
+                        : "n/a"}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="label-mono">Hardware</div>
+                    <div className="text-slate-100 text-sm mt-0.5">{health?.cache_provenance?.hardware ?? "n/a"}</div>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      </section>
+
       {/* Main Body Content */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-6">
+      <main className="flex-1 max-w-7xl w-full mx-auto px-6 pb-10">
         {activeTab === "results" ? (
           <ResultsDashboard apiBase={apiBase} />
         ) : (
           <div className="space-y-6">
             {/* Control Strip (Scenario Picker + Speed + Run Controls) */}
-            <div className="bg-slate-900/90 border border-slate-700/80 rounded-xl p-4 shadow-xl flex flex-wrap items-center justify-between gap-4">
+            <div className="bg-slate-950/70 border border-slate-800 rounded-md p-5 flex flex-wrap items-end justify-between gap-5">
               {/* Scenario Picker */}
               <div className="flex-1 min-w-[320px]">
-                <label className="block text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-1.5">
+                <label className="block label-mono mb-2">
                   Select Conversational Scenario
                 </label>
                 <select
@@ -457,7 +604,7 @@ export const App: React.FC = () => {
                     setSelectedScenarioId(e.target.value);
                     resetReplayState();
                   }}
-                  className="w-full bg-slate-950 border border-slate-700 text-slate-100 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500 disabled:opacity-50"
+                  className="w-full bg-slate-900 border border-slate-700 text-slate-100 text-sm rounded-md px-3 py-2.5 focus:outline-none focus:border-indigo-300 disabled:opacity-50"
                 >
                   {scenarios.map((sc) => (
                     <option key={sc.id} value={sc.id}>
@@ -471,7 +618,7 @@ export const App: React.FC = () => {
 
               {/* Speed Selector */}
               <div>
-                <label className="block text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-1.5">
+                <label className="block label-mono mb-2">
                   Replay Speed
                 </label>
                 <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800">
@@ -480,7 +627,7 @@ export const App: React.FC = () => {
                       key={s}
                       disabled={isRunning}
                       onClick={() => setSpeed(s)}
-                      className={`px-3 py-1 text-xs font-semibold rounded ${
+                      className={`px-3 py-1.5 font-mono text-xs rounded ${
                         speed === s
                           ? "bg-indigo-600 text-white"
                           : "text-slate-400 hover:text-slate-200"
@@ -493,12 +640,12 @@ export const App: React.FC = () => {
               </div>
 
               {/* Action Buttons */}
-              <div className="flex items-center gap-2 pt-5">
+              <div className="flex items-center gap-2">
                 {!isRunning ? (
                   <button
                     onClick={startReplay}
                     disabled={!selectedScenarioId}
-                    className="flex items-center gap-2 px-5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs transition shadow-lg shadow-emerald-600/20 disabled:opacity-50"
+                    className="btn-accent flex items-center gap-2 px-5 py-2.5 rounded-md text-sm"
                   >
                     <Play className="w-4 h-4 fill-current" />
                     Start Replay
@@ -506,7 +653,7 @@ export const App: React.FC = () => {
                 ) : (
                   <button
                     onClick={cancelReplay}
-                    className="flex items-center gap-2 px-5 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-semibold text-xs transition shadow-lg shadow-rose-600/20"
+                    className="flex items-center gap-2 px-5 py-2.5 rounded-md text-sm font-medium bg-rose-400 text-slate-950 hover:bg-rose-300 transition"
                   >
                     <Square className="w-4 h-4 fill-current" />
                     Cancel Replay
@@ -516,7 +663,7 @@ export const App: React.FC = () => {
                 <button
                   onClick={playDemoSet}
                   disabled={isRunning}
-                  className="flex items-center gap-2 px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-indigo-300 border border-slate-700 font-semibold text-xs transition disabled:opacity-50"
+                  className="btn-outline flex items-center gap-2 px-4 py-2.5 rounded-md text-sm"
                   title="Run all demo-flagged scenarios in sequence"
                 >
                   <FastForward className="w-4 h-4 text-indigo-400" />
@@ -526,44 +673,32 @@ export const App: React.FC = () => {
             </div>
 
             {/* Running Demo Set Tally Banner */}
-            {(isDemoSetRunning || demoSetTally.total > 0) && (
-              <div className="bg-indigo-950/60 border border-indigo-700/60 rounded-xl p-3 flex flex-wrap items-center justify-between text-xs text-indigo-200 shadow-md">
-                <div className="flex items-center gap-2">
-                  <FastForward className={`w-4 h-4 text-indigo-400 ${isDemoSetRunning ? "animate-pulse" : ""}`} />
-                  <span className="font-semibold">
-                    {isDemoSetRunning
-                      ? `Demo Set Running: Scenario ${demoSetIndex + 1} of ${scenarios.filter((s) => s.demo).length}`
-                      : `Demo Set Completed (${demoSetTally.total} scenarios evaluated)`}
-                  </span>
+            {(isDemoSetRunning || demoOutcomes.length > 0) && (() => {
+              const tally = summarizeDemoSet(demoOutcomes);
+              return (
+                <div className="bg-indigo-950/60 border border-indigo-700/60 rounded-xl p-3 flex flex-col gap-2 text-sm text-indigo-200 shadow-md">
+                  <div className="flex items-center gap-2">
+                    <FastForward className={`w-4 h-4 text-indigo-400 ${isDemoSetRunning ? "animate-pulse" : ""}`} />
+                    <span className="font-semibold">
+                      {isDemoSetRunning
+                        ? `Demo set running: scenario ${demoSetIndex + 1} of ${demoSetSize}`
+                        : `Demo set finished: ${tally.evaluated} of ${demoSetSize} scenarios evaluated`}
+                      {tally.errored > 0 ? ` (${tally.errored} errored)` : ""}
+                    </span>
+                  </div>
+                  <div className="font-mono text-xs flex flex-col gap-1">
+                    <span>
+                      Fixed 800 ms: <strong className="text-rose-400">{tally.fixed.cutIns} cut-ins</strong>;{" "}
+                      {formatEngineSummary(tally.fixed)}
+                    </span>
+                    <span>
+                      Patient Listener: <strong className="text-emerald-400">{tally.patientListener.cutIns} cut-ins</strong>;{" "}
+                      {formatEngineSummary(tally.patientListener)}
+                    </span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-6 font-mono text-[11px]">
-                  <span>
-                    Fixed Cut-ins: <strong className="text-rose-400 font-bold">{demoSetTally.fixedInterrupted}</strong>
-                  </span>
-                  <span>
-                    Patient Listener Cut-ins: <strong className="text-emerald-400 font-bold">{demoSetTally.plInterrupted}</strong>
-                  </span>
-                  <span>
-                    Fixed Mean Delay:{" "}
-                    <strong className="text-slate-100 font-bold">
-                      {demoSetTally.fixedDelays.length > 0
-                        ? Math.round(demoSetTally.fixedDelays.reduce((a, b) => a + b, 0) / demoSetTally.fixedDelays.length)
-                        : 0}{" "}
-                      ms
-                    </strong>
-                  </span>
-                  <span>
-                    PL Mean Delay:{" "}
-                    <strong className="text-slate-100 font-bold">
-                      {demoSetTally.plDelays.length > 0
-                        ? Math.round(demoSetTally.plDelays.reduce((a, b) => a + b, 0) / demoSetTally.plDelays.length)
-                        : 0}{" "}
-                      ms
-                    </strong>
-                  </span>
-                </div>
-              </div>
-            )}
+              );
+            })()}
 
             {/* Error Banner */}
             {replayError && (
@@ -630,6 +765,38 @@ export const App: React.FC = () => {
                     Pause silence: <strong className="text-slate-200">{Math.round(selectedScenario.silence_ms)} ms</strong>
                   </span>
                 </div>
+              </div>
+            )}
+
+            {/* Speaker pace profile: learned from this user's earlier sessions and logged regrets */}
+            {profile && (
+              <div className="bg-slate-950/70 border border-slate-800 rounded-md px-5 py-3 flex flex-wrap items-center gap-x-8 gap-y-2 text-sm">
+                <span className="label-mono">Speaker profile</span>
+                {profile.has_history ? (
+                  <>
+                    <span className="text-slate-300">
+                      Pauses then keeps talking: <strong className="text-slate-50">
+                        {profile.resumed_median_ms !== null ? `${Math.round(profile.resumed_median_ms)} ms` : "n/a"}
+                      </strong>{" "}
+                      <span className="text-slate-500">median</span>
+                    </span>
+                    <span className="text-slate-300">
+                      Pause when finished: <strong className="text-slate-50">
+                        {profile.finished_median_ms !== null ? `${Math.round(profile.finished_median_ms)} ms` : "n/a"}
+                      </strong>
+                    </span>
+                    <span className="text-slate-300">
+                      Filler rate: <strong className="text-slate-50">
+                        {profile.filler_rate !== null ? `${Math.round(profile.filler_rate * 100)}%` : "n/a"}
+                      </strong>
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-slate-400">No earlier sessions for this speaker (cold start).</span>
+                )}
+                <span className="text-slate-300">
+                  Regrets logged: <strong className="text-slate-50">{profile.regrets_count}</strong>
+                </span>
               </div>
             )}
 
@@ -724,6 +891,16 @@ export const App: React.FC = () => {
                     </strong>
                   </div>
                 </div>
+
+                {/* Regret feedback: feeds the speaker's pace profile */}
+                {fixedState.interrupted && !isRunning && (
+                  <div className="mt-3 flex flex-wrap items-center gap-3">
+                    <button onClick={logRegret} className="btn-outline px-3 py-1.5 rounded-md text-xs">
+                      Log this cut-off as a regret
+                    </button>
+                    {regretNote && <span className="text-xs text-slate-300">{regretNote}</span>}
+                  </div>
+                )}
               </div>
 
               {/* Right Panel: Patient Listener (Decider 2B) */}
@@ -832,6 +1009,31 @@ export const App: React.FC = () => {
                       </span>
                     )}
                   </div>
+
+                  {/* Assistant reply (Amazon Bedrock, or a labeled mock) */}
+                  {(plReply.text || (plState.responded && !plState.interrupted)) && (
+                    <div className="mt-3 rounded-md border border-indigo-300/30 bg-indigo-950/30 p-3">
+                      <div className="label-mono mb-1.5 flex items-center justify-between gap-2">
+                        <span>Assistant reply</span>
+                        <span className={plReply.source === "bedrock" ? "text-indigo-300" : "text-amber-300"}>
+                          {plReply.source === "bedrock"
+                            ? `Amazon Bedrock · ${plReply.modelId?.replace(/^us\.anthropic\./, "") ?? ""}`
+                            : plReply.source === "mock"
+                              ? "Mock reply"
+                              : "Generating…"}
+                        </span>
+                      </div>
+                      <p className="text-sm leading-relaxed text-slate-100 min-h-[1.25rem]">
+                        {plReply.text || <span className="text-slate-500 italic">waiting for first token…</span>}
+                      </p>
+                      {plReply.done && (
+                        <div className="mt-1.5 font-mono text-[11px] text-slate-400">
+                          {plReply.firstTokenMs !== null ? `first token ${Math.round(plReply.firstTokenMs)} ms` : ""}
+                          {plReply.error ? ` · Bedrock failed, mock used (${plReply.error.slice(0, 60)})` : ""}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 {/* Right Panel Final Result Box */}
